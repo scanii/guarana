@@ -1,3 +1,4 @@
+name: Release and Deploy
 on:
   push:
     branches:
@@ -5,19 +6,15 @@ on:
 jobs:
   record-release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-java@v2
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
-          java-version: "11"
+          java-version: "25"
+          distribution: "corretto"
           cache: "maven"
-          distribution: "zulu"
-      - uses: actions/cache@v1
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-
       - name: Retrieving version
         run: |
           VERSION_FORMAT='${parsedVersion.majorVersion}.${parsedVersion.minorVersion}.${parsedVersion.incrementalVersion}'
@@ -28,15 +25,13 @@ jobs:
         run: |
           echo "###################  using version: v$VERSION ###################"
 
-          # tag repo
           git config --global user.email "ci@uvasoftware.com"
           git config --global user.name "Github Actions"
-          git tag -a v"${VERSION}" -m "Release by Github Actions v${{ env.VERSION }}"
-          git push origin v"${{ env.VERSION }}"
+          git tag -a v"${VERSION}" -m "Release by Github Actions v${VERSION}"
+          git push origin v"${VERSION}"
 
       - name: Bumping version
         run: |
-          # bumping it to a new snapshot release:
           # shellcheck disable=SC2016
           VERSION_FORMAT='${parsedVersion.majorVersion}.${parsedVersion.nextMinorVersion}.${parsedVersion.incrementalVersion}-SNAPSHOT'
           mvn -q build-helper:parse-version versions:set -DnewVersion="${VERSION_FORMAT}" versions:commit
@@ -45,7 +40,6 @@ jobs:
 
           echo "next version is: $VERSION"
 
-          #commit version change
           git status
           git commit -a -m "bump to ${VERSION} [ci skip]"
           git push origin main
@@ -55,24 +49,42 @@ jobs:
     if: "!contains(github.event.commits[0].message, '[ci skip]')"
     runs-on: ubuntu-latest
     needs: [ record-release ]
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-java@v2
+      - uses: actions/checkout@v4
         with:
-          java-version: "11"
+          ref: main
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "25"
+          distribution: "corretto"
           cache: "maven"
-          distribution: "zulu"
-      - uses: actions/cache@v1
+      - uses: aws-actions/setup-sam@v2
         with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            ${{ runner.os }}-maven-
+          use-installer: true
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        id: aws-creds
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_PROD_ACCOUNT_ID }}:role/scanii-lambda-gha
+          role-session-name: gha-scanii-lambda-release
           aws-region: us-east-1
-      - name: Deploy
-        run: ./.github/workflows/deploy.sh
+
+      - name: Strip snapshot marker
+        run: |
+          # shellcheck disable=SC2016
+          VERSION_FORMAT='${parsedVersion.majorVersion}.${parsedVersion.minorVersion}.${parsedVersion.incrementalVersion}'
+          mvn -q build-helper:parse-version versions:set -DnewVersion="${VERSION_FORMAT}" versions:commit
+
+      - name: Build
+        run: mvn -q -DskipTests clean package
+
+      - name: SAM package
+        run: |
+          sam package \
+            --s3-bucket scanii-assets \
+            --s3-prefix sam/guarana \
+            --template-file template.yml \
+            --output-template-file guarana.yaml
