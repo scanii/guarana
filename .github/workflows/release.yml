@@ -1,8 +1,7 @@
 name: Release and Deploy
 on:
-  push:
-    branches:
-      - main
+  release:
+    types: [ published ]
 jobs:
   deploy-production-us:
     runs-on: ubuntu-latest
@@ -11,9 +10,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-tags: true
-          fetch-depth: 0
       - uses: actions/setup-java@v4
         with:
           java-version: "25"
@@ -30,42 +26,39 @@ jobs:
           role-session-name: gha-scanii-guarana-release
           aws-region: us-east-1
 
-      - name: Compute next version
+      - name: Derive version
         id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          LATEST_TAG=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)
-          if [ -z "$LATEST_TAG" ]; then
-            echo "No prior v* tag found; cannot derive next version." >&2
-            exit 1
-          fi
-          PREV=${LATEST_TAG#v}
-          MAJOR=$(echo "$PREV" | cut -d. -f1)
-          MINOR=$(echo "$PREV" | cut -d. -f2)
-          NEXT="${MAJOR}.$((MINOR + 1)).0"
-          echo "Previous tag: $LATEST_TAG -> Next: v$NEXT"
-          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
-          echo "tag=v$NEXT" >> "$GITHUB_OUTPUT"
+          VERSION=${TAG#v}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set pom version
         run: mvn -q versions:set -DnewVersion="${{ steps.version.outputs.version }}" -DgenerateBackupPoms=false
 
-      - name: Build
-        run: mvn -q -DskipTests clean package
+      - name: Build and package
+        run: make build package
 
-      - name: SAM package
+      - name: Publish to Serverless Application Repository
+        env:
+          LC_ALL: C.UTF-8
+          LANG: C.UTF-8
+          AWS_DEFAULT_REGION: us-east-1
+          SAM_CLI_TELEMETRY: 0
+          ACCOUNT_ID: ${{ steps.aws-creds.outputs.aws-account-id }}
+          APPLICATION: uvasoftware-guarana
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          sam package \
-            --s3-bucket scanii-assets \
-            --s3-prefix sam/guarana \
-            --template-file template.yml \
-            --output-template-file guarana.yaml
+          aws serverlessrepo create-application-version \
+            --application-id "arn:aws:serverlessrepo:us-east-1:${ACCOUNT_ID}:applications/${APPLICATION}" \
+            --semantic-version "${VERSION}" \
+            --source-code-url "https://github.com/scanii/guarana/releases/tag/v${VERSION}" \
+            --template-body file://guarana.yaml >/dev/null
+          echo "SAM application ${APPLICATION} version ${VERSION} published!"
 
-      - name: Create GitHub release
+      - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ steps.version.outputs.tag }}" \
-            --target "${{ github.sha }}" \
-            --title "${{ steps.version.outputs.tag }}" \
-            --notes "Lambda deployed from ${{ github.sha }} by run ${{ github.run_id }}." \
-            guarana.yaml target/guarana.jar
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" guarana.yaml target/guarana.jar --clobber
